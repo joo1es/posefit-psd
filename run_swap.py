@@ -289,14 +289,15 @@ def save_5layer_psd_and_png(img_a_rgb, clean_bg_bgr, raw_b_rgb, aligned_body_b, 
         channels={-1: head_a[:, :, 3], 0: head_a[:, :, 0], 1: head_a[:, :, 1], 2: head_a[:, :, 2]}
     )
 
-    # 在 Photoshop 中，PS 图层面板自顶向下显示。
-    # 传入 nested_layers_to_psd 的顺序必须为：[最底层 ... 最顶层]
-    # 这样生成的 PSD 在 Photoshop 里：
-    # 第一行 (最顶层): Photo A Head
-    # 第二行: Photo B Body
-    # 第三行: Photo B Body 不rmbg (隐藏)
-    # 第四行: Clean Background
-    # 第五行 (最底层): 原图 (隐藏)
+    # Photoshop 图层面板自顶向下显示：
+    # 经实测验证，传入 nested_layers_to_psd 的顺序为 [底, ..., 顶]：
+    # 即：[原图, Clean Background, Photo B Body 不rmbg, Photo B Body, Photo A Head]
+    # 这样在 Photoshop 中：
+    # 第 1 行 (最顶层): Photo A Head (显示)
+    # 第 2 行: Photo B Body (显示)
+    # 第 3 行: Photo B Body 不rmbg (隐藏)
+    # 第 4 行: Clean Background (显示)
+    # 第 5 行 (最底层): 原图 (隐藏)
     layers_order = [l1_orig_a, l2_clean_bg, l3_raw_b, l4_body_b, l5_head_a]
     psd = nested_layers.nested_layers_to_psd(layers_order, color_mode=pytoshop.enums.ColorMode.rgb)
     with open(out_psd_path, 'wb') as f:
