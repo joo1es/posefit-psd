@@ -97,12 +97,10 @@ def detect_pose(image_path, model_path, person_idx=None):
     else:
         # 未指定时：如果有多人，默认优先选最居中的主要主体
         target_cand = min(candidates, key=lambda c: abs(c['center_x'] - w / 2.0))
-        if total_persons > 1:
-            print(f"   [默认主体] 自动选定画面中心主体 (画面X中心={target_cand['center_x']:.1f}px)")
+    other_candidates = [c for c in candidates if c != target_cand]
+    return target_cand['landmarks'], w, h, other_candidates
 
-    return target_cand['landmarks'], w, h
-
-def get_person_geometry(landmarks, width, height):
+def get_person_geometry(landmarks, width, height, other_candidates=None):
     ls = np.array([landmarks[11].x * width, landmarks[11].y * height], dtype=np.float32)
     rs = np.array([landmarks[12].x * width, landmarks[12].y * height], dtype=np.float32)
     nose = np.array([landmarks[0].x * width, landmarks[0].y * height], dtype=np.float32)
@@ -163,6 +161,22 @@ def get_person_geometry(landmarks, width, height):
     if eye_dist > 5.0 and (shoulder_width / eye_dist) < 3.3:
         is_side_angle = True
 
+    other_centers = []
+    other_hulls = []
+    if other_candidates:
+        for oc in other_candidates:
+            other_centers.append(oc['center_x'])
+            oc_lms = oc['landmarks']
+            pts = []
+            for pt in oc_lms:
+                if pt.visibility > 0.15 and 0 <= pt.x <= 1.0 and 0 <= pt.y <= 1.0:
+                    pts.append([int(pt.x * width), int(pt.y * height)])
+            if len(pts) >= 4:
+                hull = cv2.convexHull(np.array(pts, dtype=np.int32))
+                hull_mask = np.zeros((height, width), dtype=np.uint8)
+                cv2.fillConvexPoly(hull_mask, hull, 255)
+                other_hulls.append(hull_mask)
+
     return {
         'neck': neck,
         'left_shoulder': ls,
@@ -183,7 +197,9 @@ def get_person_geometry(landmarks, width, height):
         'ground_y': ground_y,
         'img_height': height,
         'img_width': width,
-        'landmarks': landmarks
+        'landmarks': landmarks,
+        'other_centers': other_centers,
+        'other_hulls': other_hulls
     }
 
 def inpaint_remove_original_body(img_a_bgr, rgba_a, geom_a, norm_up, aligned_body_b=None, geom_b=None):
@@ -225,22 +241,48 @@ def inpaint_remove_original_body(img_a_bgr, rgba_a, geom_a, norm_up, aligned_bod
                     print(f"   [智能半身穿搭融合] 识别为标准半身上衣+全身下装组合，自动锁定下摆(Y={max_y_b})，完整保留A原有的下半身与腿部！")
 
     # 3. 根据脖子法向量切分出原图A的身体区域（排除头部）
+    # 将切割平面略微上推（12% 肩宽），确保高领/立领等衣领也被完全抹除
+    collar_overshoot = geom_a['shoulder_width'] * 0.12
+    adjusted_neck = neck_point + norm_up * collar_overshoot
     y_coords, x_coords = np.ogrid[:h, :w]
-    dot = (x_coords - neck_point[0]) * norm_up[0] + (y_coords - neck_point[1]) * norm_up[1]
+    dot = (x_coords - adjusted_neck[0]) * norm_up[0] + (y_coords - adjusted_neck[1]) * norm_up[1]
     
+    # 针对多人照：如果A图有其他人物（other_centers），精确保护其他同伴不被误抹！
+    other_centers = geom_a.get('other_centers', [])
+    sh_x = geom_a['mid_shoulder'][0]
+    is_target_side = np.ones((h, w), dtype=bool)
+    if other_centers:
+        for oc in other_centers:
+            mid_div = (sh_x + oc) / 2.0
+            if sh_x < oc:
+                # 目标在左侧，抹除区严格限制在分割线以左
+                is_target_side = is_target_side & (x_coords <= mid_div)
+            else:
+                # 目标在右侧，抹除区严格限制在分割线以右
+                is_target_side = is_target_side & (x_coords >= mid_div)
+        print("   [多人保护] 自动建立人物分割边界，绝对不破坏照片中其他同伴！")
+
     if retain_lower_body:
         # 只抹除到 B 身体下沿以上 6 像素处，让 B 的下摆自然搭在 A 的腰部/裤头上
         cutoff_y = max(0, max_y_b - 6)
-        is_body = (dot < 0.0) & (person_alpha > 20) & (y_coords <= cutoff_y)
+        is_body = (dot < 0.0) & (person_alpha > 20) & (y_coords <= cutoff_y) & is_target_side
     else:
-        is_body = (dot < 0.0) & (person_alpha > 20)
+        is_body = (dot < 0.0) & (person_alpha > 20) & is_target_side
         
     body_mask = is_body.astype(np.uint8) * 255
 
     # 4. 膨胀身体抹除遮罩以彻底消除衣物边缘，但严格扣除面部保护区！
     kernel_body = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))
     body_mask_dilated = cv2.dilate(body_mask, kernel_body, iterations=1)
-    
+
+    if other_centers:
+        # 绝不膨胀进同伴区域
+        body_mask_dilated[~is_target_side] = 0
+        # 如果有同伴的关键点凸包（other_hulls），从抹除遮罩中彻底扣除并微幅膨胀保护
+        for hull_other in geom_a.get('other_hulls', []):
+            hull_other_dilated = cv2.dilate(hull_other, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)), iterations=1)
+            body_mask_dilated = cv2.subtract(body_mask_dilated, hull_other_dilated)
+
     if retain_lower_body:
         # 绝不让膨胀遮罩蔓延到保留的裤子区域
         body_mask_dilated[cutoff_y:, :] = 0
@@ -506,11 +548,11 @@ def run_swap(target_a, donor_b, output_prefix, target_person=None, donor_person=
 
     # 1. 骨骼点检测（支持多人照片指定选人）
     print("[1/5] 检测双人骨骼点（颈肩、腰胯、脚底接地）...")
-    lm_a, w_a, h_a = detect_pose(target_a, model_path, person_idx=target_person)
-    lm_b, w_b, h_b = detect_pose(donor_b, model_path, person_idx=donor_person)
+    lm_a, w_a, h_a, others_a = detect_pose(target_a, model_path, person_idx=target_person)
+    lm_b, w_b, h_b, others_b = detect_pose(donor_b, model_path, person_idx=donor_person)
 
-    geom_a = get_person_geometry(lm_a, w_a, h_a)
-    geom_b = get_person_geometry(lm_b, w_b, h_b)
+    geom_a = get_person_geometry(lm_a, w_a, h_a, other_candidates=others_a)
+    geom_b = get_person_geometry(lm_b, w_b, h_b, other_candidates=others_b)
 
     # 2. 抠图与部位拆分
     print("[2/5] 智能抠图并分离头部与身体...")
