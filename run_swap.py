@@ -292,10 +292,9 @@ def save_5layer_psd_and_png(img_a_rgb, clean_bg_bgr, raw_b_rgb, aligned_body_b, 
         channels={-1: head_a[:, :, 3], 0: head_a[:, :, 0], 1: head_a[:, :, 1], 2: head_a[:, :, 2]}
     )
 
-    # 必须传入 [01, 02, 03, 04, 05]：
-    # pytoshop 在内部会自动反转，反转后 [05] Photo A Head 会位于 PSD 文件的第 1 个图层槽位 (Slot 0)，
-    # 这样在 Photoshop 图层面板中，第 1 行【最顶层】就是 [05] Photo A Head，最底层就是 [01] Original！
-    layers_order = [l1_orig_a, l2_clean_bg, l3_raw_b, l4_body_b, l5_head_a]
+    # 传入图层顺序：[05, 04, 03, 02, 01]
+    # 在 Photoshop 图层面板中自顶向下排布：[05] 头在最顶层，[01] 原图在最底层
+    layers_order = [l5_head_a, l4_body_b, l3_raw_b, l2_clean_bg, l1_orig_a]
     psd = nested_layers.nested_layers_to_psd(layers_order, color_mode=pytoshop.enums.ColorMode.rgb)
     with open(out_psd_path, 'wb') as f:
         psd.write(f)
