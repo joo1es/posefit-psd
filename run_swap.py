@@ -21,19 +21,86 @@ import pytoshop
 from pytoshop.user import nested_layers
 import rembg
 
-def detect_pose(image_path, model_path):
+def detect_pose(image_path, model_path, person_idx=None):
+    img = cv2.imread(image_path)
+    h, w = img.shape[:2]
     base_options = python.BaseOptions(model_asset_path=model_path)
     options = vision.PoseLandmarkerOptions(
         base_options=base_options,
-        num_poses=1,
+        num_poses=5,
         output_segmentation_masks=False
     )
     detector = vision.PoseLandmarker.create_from_options(options)
-    mp_img = mp.Image.create_from_file(image_path)
-    res = detector.detect(mp_img)
-    if not res.pose_landmarks:
+    
+    # 1. 全图检测
+    mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    res_full = detector.detect(mp_img)
+    
+    raw_list = []
+    if res_full.pose_landmarks:
+        for lm in res_full.pose_landmarks:
+            raw_list.append((lm, 0, w))
+            
+    # 2. 补充左半区(0~60%)与右半区(40%~100%)切片检测，彻底解决多人亲密贴合导致全图漏检/重叠误检的问题
+    left_crop = img[:, :int(w * 0.6)]
+    right_crop = img[:, int(w * 0.4):]
+    off_r = int(w * 0.4)
+    
+    mp_left = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(left_crop, cv2.COLOR_BGR2RGB))
+    mp_right = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(right_crop, cv2.COLOR_BGR2RGB))
+    res_l = detector.detect(mp_left)
+    res_r = detector.detect(mp_right)
+    
+    if res_l.pose_landmarks:
+        raw_list.append((res_l.pose_landmarks[0], 0, left_crop.shape[1]))
+    if res_r.pose_landmarks:
+        raw_list.append((res_r.pose_landmarks[0], off_r, right_crop.shape[1]))
+
+    if not raw_list:
         raise ValueError(f"未能检测到人体姿态: {image_path}")
-    return res.pose_landmarks[0], mp_img.width, mp_img.height
+
+    class NormLM:
+        def __init__(self, x, y, z, vis, pres):
+            self.x, self.y, self.z, self.visibility, self.presence = x, y, z, vis, pres
+
+    # 3. 去重与坐标全局归一化
+    candidates = []
+    for lm, off_x, crop_w in raw_list:
+        sh_x = (lm[11].x + lm[12].x) / 2.0 * crop_w + off_x
+        is_dup = False
+        for c in candidates:
+            if abs(c['center_x'] - sh_x) < 0.15 * w:
+                is_dup = True
+                break
+        if not is_dup:
+            adj_lm = []
+            for pt in lm:
+                adj_lm.append(NormLM((pt.x * crop_w + off_x) / float(w), pt.y, pt.z, pt.visibility, pt.presence))
+            candidates.append({'landmarks': adj_lm, 'center_x': sh_x})
+
+    # 从左向右排序 (1:最左, 2:往右...)
+    candidates.sort(key=lambda c: c['center_x'])
+    total_persons = len(candidates)
+    
+    if total_persons > 1:
+        print(f"   [多人检测] 在 {image_path} 中共识别到 {total_persons} 个人物 (从左到右: {[round(c['center_x'], 1) for c in candidates]})")
+    
+    # 用户指定人物序号 (1-indexed: 1, 2, ... 或负数 -1: 最后一个)
+    if person_idx is not None:
+        idx = person_idx - 1 if person_idx > 0 else person_idx
+        if idx >= total_persons or idx < -total_persons:
+            print(f"   [警告] 指定人物索引 {person_idx} 超出范围 (共 {total_persons} 人)，默认使用最靠近中心的人物")
+            target_cand = min(candidates, key=lambda c: abs(c['center_x'] - w / 2.0))
+        else:
+            target_cand = candidates[idx]
+            print(f"   [人物选定] 已选定第 {person_idx} 个人物 (画面X中心={target_cand['center_x']:.1f}px)")
+    else:
+        # 未指定时：如果有多人，默认优先选最居中的主要主体
+        target_cand = min(candidates, key=lambda c: abs(c['center_x'] - w / 2.0))
+        if total_persons > 1:
+            print(f"   [默认主体] 自动选定画面中心主体 (画面X中心={target_cand['center_x']:.1f}px)")
+
+    return target_cand['landmarks'], w, h
 
 def get_person_geometry(landmarks, width, height):
     ls = np.array([landmarks[11].x * width, landmarks[11].y * height], dtype=np.float32)
@@ -79,6 +146,8 @@ def get_person_geometry(landmarks, width, height):
         if thigh_drop > 0.08 and calf_drop > 0.06:
             is_standing = True
 
+    has_visible_legs = len(foot_pts_y) >= 2
+    is_sitting = has_visible_legs and (not is_standing)
     is_full_body = is_standing
     ground_y = float(np.max(foot_pts_y)) if is_full_body else None
 
@@ -109,13 +178,15 @@ def get_person_geometry(landmarks, width, height):
         'torso_height': torso_height,
         'nose': nose,
         'is_full_body': is_full_body,
+        'is_sitting': is_sitting,
+        'has_visible_legs': has_visible_legs,
         'ground_y': ground_y,
         'img_height': height,
         'img_width': width,
         'landmarks': landmarks
     }
 
-def inpaint_remove_original_body(img_a_bgr, rgba_a, geom_a, norm_up):
+def inpaint_remove_original_body(img_a_bgr, rgba_a, geom_a, norm_up, aligned_body_b=None, geom_b=None):
     h, w = img_a_bgr.shape[:2]
     person_alpha = rgba_a[:, :, 3]
     neck_point = geom_a['neck']
@@ -134,18 +205,53 @@ def inpaint_remove_original_body(img_a_bgr, rgba_a, geom_a, norm_up):
     kernel_face = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
     face_protected = cv2.dilate(face_protected, kernel_face, iterations=2)
 
-    # 2. 根据脖子法向量切分出原图A的身体区域（排除头部）
+    # 2. 智能下半身保留判定：
+    # 当且仅当：
+    # 1) 目标图A包含全身站姿 (geom_a['is_full_body'] 为 True)
+    # 2) 供体B是纯半身照（没有明显下肢/不是坐姿抱膝等有腿姿态，即 not geom_b['has_visible_legs']）
+    # 3) 供体B对齐后的下沿明显高于 A 的脚底（留出至少 15% 身高空间）
+    # 此时属于典型的“换上衣/保留A原生裤子与腿”穿搭场景，自动锁定下摆，完整保留A原有的下半身！
+    # 反之：如果B本身是坐姿（比如抱膝坐在沙发/椅子上），B带有自己的腿和裤子，必须抹除A原有的站姿腿，绝对不能出现四条腿拼接！
+    retain_lower_body = False
+    max_y_b = h
+    if aligned_body_b is not None and geom_b is not None:
+        if geom_a.get('is_full_body', False) and (not geom_b.get('is_full_body', False)) and (not geom_b.get('is_sitting', False)) and (not geom_b.get('has_visible_legs', False)):
+            alpha_b = aligned_body_b[:, :, 3]
+            y_indices_b = np.where(alpha_b > 20)[0]
+            if len(y_indices_b) > 0:
+                max_y_b = int(y_indices_b.max())
+                if geom_a['ground_y'] is not None and (geom_a['ground_y'] - max_y_b) > 0.15 * h:
+                    retain_lower_body = True
+                    print(f"   [智能半身穿搭融合] 识别为标准半身上衣+全身下装组合，自动锁定下摆(Y={max_y_b})，完整保留A原有的下半身与腿部！")
+
+    # 3. 根据脖子法向量切分出原图A的身体区域（排除头部）
     y_coords, x_coords = np.ogrid[:h, :w]
     dot = (x_coords - neck_point[0]) * norm_up[0] + (y_coords - neck_point[1]) * norm_up[1]
-    is_body = (dot < 0.0) & (person_alpha > 20)
+    
+    if retain_lower_body:
+        # 只抹除到 B 身体下沿以上 6 像素处，让 B 的下摆自然搭在 A 的腰部/裤头上
+        cutoff_y = max(0, max_y_b - 6)
+        is_body = (dot < 0.0) & (person_alpha > 20) & (y_coords <= cutoff_y)
+    else:
+        is_body = (dot < 0.0) & (person_alpha > 20)
+        
     body_mask = is_body.astype(np.uint8) * 255
 
-    # 3. 膨胀身体抹除遮罩以彻底消除衣物边缘，但严格扣除面部保护区！
+    # 4. 膨胀身体抹除遮罩以彻底消除衣物边缘，但严格扣除面部保护区！
     kernel_body = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))
     body_mask_dilated = cv2.dilate(body_mask, kernel_body, iterations=1)
+    
+    if retain_lower_body:
+        # 绝不让膨胀遮罩蔓延到保留的裤子区域
+        body_mask_dilated[cutoff_y:, :] = 0
+        
     body_mask_final = cv2.subtract(body_mask_dilated, face_protected)
 
-    print("   [Inpaint] 正在抹除原图A中原有的身体、双腿和鞋子，保护完整面容与下颌...")
+    if retain_lower_body:
+        print("   [Inpaint] 仅抹除原图A的上半身衣物，100%保留原生下装与裤腿，保护面容与下颌...")
+    else:
+        print("   [Inpaint] 正在抹除原图A中原有的身体、双腿和鞋子，保护完整面容与下颌...")
+        
     clean_bg = cv2.inpaint(img_a_bgr, body_mask_final, inpaintRadius=7, flags=cv2.INPAINT_TELEA)
     return clean_bg
 
@@ -161,13 +267,37 @@ def extract_head_a(rgba_a, neck_point, norm_up):
     head_rgba[:, :, 3] = (head_rgba[:, :, 3].astype(np.float32) * head_mask).astype(np.uint8)
     return head_rgba
 
-def extract_body_b(rgba_b, neck_point, norm_up):
+def extract_body_b(rgba_b, neck_point, norm_up, geom_b=None):
     h, w = rgba_b.shape[:2]
     y_coords, x_coords = np.ogrid[:h, :w]
     dot = (x_coords - neck_point[0]) * norm_up[0] + (y_coords - neck_point[1]) * norm_up[1]
 
     feather = 10.0
     body_mask = np.clip((-dot + feather) / (2 * feather), 0.0, 1.0)
+
+    # 当供体照片中有多人，或身体周围有他人干扰时，使用选定人物的关键点凸包限制横向范围
+    if geom_b is not None and 'landmarks' in geom_b:
+        lms = geom_b['landmarks']
+        body_pts = []
+        # 收集选定人物的身体主要关节点 (肩膀11,12、肘13,14、手腕15,16、髋23,24、膝25,26、踝27,28)
+        for idx in [11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28]:
+            if idx < len(lms):
+                lm = lms[idx]
+                if lm.visibility > 0.2 and 0 <= lm.x <= 1.0 and 0 <= lm.y <= 1.0:
+                    body_pts.append([int(lm.x * w), int(lm.y * h)])
+        if len(body_pts) >= 4:
+            pts_arr = np.array(body_pts, dtype=np.int32)
+            hull = cv2.convexHull(pts_arr)
+            hull_mask = np.zeros((h, w), dtype=np.uint8)
+            cv2.fillConvexPoly(hull_mask, hull, 255)
+            # 适度膨胀以覆盖衣物轮廓与外沿
+            sh_w = int(geom_b.get('shoulder_width', 50))
+            k_size = max(15, int(sh_w * 0.35))
+            if k_size % 2 == 0:
+                k_size += 1
+            kernel_hull = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
+            hull_mask = cv2.dilate(hull_mask, kernel_hull, iterations=2)
+            body_mask = body_mask * (hull_mask.astype(np.float32) / 255.0)
 
     body_rgba = rgba_b.copy()
     body_rgba[:, :, 3] = (body_rgba[:, :, 3].astype(np.float32) * body_mask).astype(np.uint8)
@@ -360,7 +490,7 @@ def save_5layer_psd_and_png(img_a_rgb, clean_bg_bgr, raw_b_rgb, aligned_body_b, 
         psd.write(f)
     print(f"[5图层 PSD]: {out_psd_path}")
 
-def run_swap(target_a, donor_b, output_prefix):
+def run_swap(target_a, donor_b, output_prefix, target_person=None, donor_person=None):
     model_path = r"C:\Users\jooies\Downloads\person\models\pose_landmarker.task"
     out_psd = f"{output_prefix}.psd"
     out_png = f"{output_prefix}.png"
@@ -374,10 +504,10 @@ def run_swap(target_a, donor_b, output_prefix):
     img_b_pil = Image.open(donor_b).convert('RGB')
     img_b_rgb = np.array(img_b_pil)
 
-    # 1. 骨骼点检测
+    # 1. 骨骼点检测（支持多人照片指定选人）
     print("[1/5] 检测双人骨骼点（颈肩、腰胯、脚底接地）...")
-    lm_a, w_a, h_a = detect_pose(target_a, model_path)
-    lm_b, w_b, h_b = detect_pose(donor_b, model_path)
+    lm_a, w_a, h_a = detect_pose(target_a, model_path, person_idx=target_person)
+    lm_b, w_b, h_b = detect_pose(donor_b, model_path, person_idx=donor_person)
 
     geom_a = get_person_geometry(lm_a, w_a, h_a)
     geom_b = get_person_geometry(lm_b, w_b, h_b)
@@ -394,15 +524,10 @@ def run_swap(target_a, donor_b, output_prefix):
     norm_up_b = neck_up_b / (np.linalg.norm(neck_up_b) + 1e-5)
 
     head_a = extract_head_a(rgba_a, geom_a['neck'], norm_up_a)
-    body_b = extract_body_b(rgba_b, geom_b['neck'], norm_up_b)
+    body_b = extract_body_b(rgba_b, geom_b['neck'], norm_up_b, geom_b=geom_b)
 
-    # 3. 擦除原图A身体
-    print("[3/5] 底图人像遮罩擦除 (生成 Clean Background)...")
-    img_a_bgr = cv2.imread(target_a)
-    clean_bg = inpaint_remove_original_body(img_a_bgr, rgba_a, geom_a, norm_up_a)
-
-    # 4. 计算变换矩阵并对齐
-    print("[4/5] 计算姿态几何对齐变换（自适应腰部/地平线锁定）...")
+    # 3. 计算姿态几何对齐变换（自适应腰部/地平线锁定）
+    print("[3/5] 计算姿态几何对齐变换（自适应腰部/地平线锁定）...")
     M = compute_alignment_matrix(geom_a, geom_b)
     aligned_body_b = cv2.warpAffine(
         body_b, M, (w_a, h_a),
@@ -410,6 +535,11 @@ def run_swap(target_a, donor_b, output_prefix):
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=(0, 0, 0, 0)
     )
+
+    # 4. 擦除原图A身体（智能保留下半身）
+    print("[4/5] 底图人像遮罩擦除 (生成 Clean Background)...")
+    img_a_bgr = cv2.imread(target_a)
+    clean_bg = inpaint_remove_original_body(img_a_bgr, rgba_a, geom_a, norm_up_a, aligned_body_b=aligned_body_b, geom_b=geom_b)
 
     # 5. 打包 5 图层 PSD 与 预览 PNG
     print("[5/5] 保存 5 图层 PSD 与 PNG 预览图...")
@@ -420,7 +550,9 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="生成标准 5 图层 PSD 的全自动头身对齐工具")
     parser.add_argument("--target", required=True, help="目标照片A路径")
     parser.add_argument("--donor", required=True, help="身体照片B路径")
+    parser.add_argument("--target_person", type=int, default=None, help="目标图A人物序号(从左到右1, 2...，默认居中主体)")
+    parser.add_argument("--donor_person", type=int, default=None, help="身体图B人物序号(从左到右1, 2...，默认居中主体)")
     parser.add_argument("--output", default="final_5layers_swap", help="输出文件前缀")
     args = parser.parse_args()
 
-    run_swap(args.target, args.donor, args.output)
+    run_swap(args.target, args.donor, args.output, target_person=args.target_person, donor_person=args.donor_person)
