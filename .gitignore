@@ -1,0 +1,20 @@
+# Python virtual environment
+.venv/
+venv/
+ENV/
+__pycache__/
+*.pyc
+
+# Heavy model files (auto-downloaded)
+models/*.task
+*.task
+
+# Output PSD and generated images
+*.psd
+*.png
+!demo_assets/*.png
+!assets/*.png
+
+# OS metadata
+.DS_Store
+Thumbs.db
