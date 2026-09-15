@@ -59,13 +59,27 @@ def get_person_geometry(landmarks, width, height):
         lh_pt, rh_pt, mid_waist, waist_width = None, None, None, None
         torso_height = float(height - neck[1])
 
+    # 腿部与脚踝姿态分析：判断是否为真正垂直站立 (Standing) 还是 坐姿/屈腿 (Sitting/Kneeling)
     foot_pts_y = []
     for idx in [27, 28, 29, 30, 31, 32]:
         lm = landmarks[idx]
         if lm.visibility > 0.35 and lm.presence > 0.35 and 0.0 <= lm.y <= 1.05:
             foot_pts_y.append(lm.y * height)
     
-    is_full_body = len(foot_pts_y) >= 2
+    # 严格的站立姿态判定：
+    # 真正站立时，髋关节 -> 膝盖 -> 踝关节 必须沿重力方向呈现显著递增的垂直落差（大腿小腿垂直伸展）
+    is_standing = False
+    if len(foot_pts_y) >= 2 and has_visible_hip:
+        hip_y = (landmarks[23].y + landmarks[24].y) / 2.0
+        knee_y = (landmarks[25].y + landmarks[26].y) / 2.0
+        ankle_y = (landmarks[27].y + landmarks[28].y) / 2.0
+        thigh_drop = knee_y - hip_y
+        calf_drop = ankle_y - knee_y
+        # 站姿时大腿和小腿纵向落差均显著大于 0.08（图像归一化高度）
+        if thigh_drop > 0.08 and calf_drop > 0.06:
+            is_standing = True
+
+    is_full_body = is_standing
     ground_y = float(np.max(foot_pts_y)) if is_full_body else None
 
     return {
@@ -82,24 +96,42 @@ def get_person_geometry(landmarks, width, height):
         'is_full_body': is_full_body,
         'ground_y': ground_y,
         'img_height': height,
-        'img_width': width
+        'img_width': width,
+        'landmarks': landmarks
     }
 
-def inpaint_remove_original_body(img_a_bgr, rgba_a, neck_point, norm_up):
+def inpaint_remove_original_body(img_a_bgr, rgba_a, geom_a, norm_up):
     h, w = img_a_bgr.shape[:2]
     person_alpha = rgba_a[:, :, 3]
+    neck_point = geom_a['neck']
+    landmarks = geom_a['landmarks']
 
-    # 根据脖子法向量切分出原图A的身体区域（排除头部）
+    # 1. 构建面部与下颌保护区（绝不可被抹除模糊）：
+    # 提取头面部特征点 (0:鼻尖, 1-6:眼部, 7-8:耳部, 9-10:口唇)
+    head_points = []
+    for i in range(11):
+        head_points.append([int(landmarks[i].x * w), int(landmarks[i].y * h)])
+    head_points = np.array(head_points, dtype=np.int32)
+
+    hull = cv2.convexHull(head_points)
+    face_protected = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillConvexPoly(face_protected, hull, 255)
+    kernel_face = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    face_protected = cv2.dilate(face_protected, kernel_face, iterations=2)
+
+    # 2. 根据脖子法向量切分出原图A的身体区域（排除头部）
     y_coords, x_coords = np.ogrid[:h, :w]
     dot = (x_coords - neck_point[0]) * norm_up[0] + (y_coords - neck_point[1]) * norm_up[1]
-    is_body = (dot < 5.0) & (person_alpha > 20)
-
+    is_body = (dot < 0.0) & (person_alpha > 20)
     body_mask = is_body.astype(np.uint8) * 255
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
-    body_mask_dilated = cv2.dilate(body_mask, kernel, iterations=2)
 
-    print("   [Inpaint] 正在抹除原图A中原有的身体、双腿和鞋子，生成干净底图...")
-    clean_bg = cv2.inpaint(img_a_bgr, body_mask_dilated, inpaintRadius=9, flags=cv2.INPAINT_TELEA)
+    # 3. 膨胀身体抹除遮罩以彻底消除衣物边缘，但严格扣除面部保护区！
+    kernel_body = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))
+    body_mask_dilated = cv2.dilate(body_mask, kernel_body, iterations=1)
+    body_mask_final = cv2.subtract(body_mask_dilated, face_protected)
+
+    print("   [Inpaint] 正在抹除原图A中原有的身体、双腿和鞋子，保护完整面容与下颌...")
+    clean_bg = cv2.inpaint(img_a_bgr, body_mask_final, inpaintRadius=7, flags=cv2.INPAINT_TELEA)
     return clean_bg
 
 def extract_head_a(rgba_a, neck_point, norm_up):
@@ -338,7 +370,7 @@ def run_swap(target_a, donor_b, output_prefix):
     # 3. 擦除原图A身体
     print("[3/5] 底图人像遮罩擦除 (生成 Clean Background)...")
     img_a_bgr = cv2.imread(target_a)
-    clean_bg = inpaint_remove_original_body(img_a_bgr, rgba_a, geom_a['neck'], norm_up_a)
+    clean_bg = inpaint_remove_original_body(img_a_bgr, rgba_a, geom_a, norm_up_a)
 
     # 4. 计算变换矩阵并对齐
     print("[4/5] 计算姿态几何对齐变换（自适应腰部/地平线锁定）...")
