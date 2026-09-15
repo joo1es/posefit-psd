@@ -237,11 +237,10 @@ def save_5layer_psd_and_png(img_a_rgb, clean_bg_bgr, raw_b_rgb, aligned_body_b, 
     aligned_raw_b = fit_torso_width(aligned_raw_b, geom_a, geom_b, M)
 
     # 1. 导出合并 PNG 预览
+    # 采用 Clean Background 中的 100% 原始未抠图头部与发丝，避免抠图毛刺
     comp = clean_bg_rgb.astype(np.float32)
     alpha_body = aligned_body_b[:, :, 3:4].astype(np.float32) / 255.0
     comp = aligned_body_b[:, :, :3] * alpha_body + comp * (1.0 - alpha_body)
-    alpha_head = head_a[:, :, 3:4].astype(np.float32) / 255.0
-    comp = head_a[:, :, :3] * alpha_head + comp * (1.0 - alpha_head)
     
     comp_arr = np.clip(comp, 0, 255).astype(np.uint8)
     Image.fromarray(comp_arr).save(out_png_path)
@@ -284,10 +283,10 @@ def save_5layer_psd_and_png(img_a_rgb, clean_bg_bgr, raw_b_rgb, aligned_body_b, 
         channels={-1: aligned_body_b[:, :, 3], 0: aligned_body_b[:, :, 0], 1: aligned_body_b[:, :, 1], 2: aligned_body_b[:, :, 2]}
     )
 
-    # Layer 5 (顶层人像A头): [05] Photo A Head (Foreground) - 显示
+    # Layer 5 (顶层人像A头备用): [05] Photo A Head (Foreground) - 隐藏（按方案A默认关闭，保留备用）
     l5_head_a = nested_layers.Image(
         name='[05] Photo A Head (Foreground)',
-        visible=True,
+        visible=False,
         top=0, left=0, bottom=h_a, right=w_a,
         channels={-1: head_a[:, :, 3], 0: head_a[:, :, 0], 1: head_a[:, :, 1], 2: head_a[:, :, 2]}
     )
