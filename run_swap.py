@@ -85,18 +85,21 @@ def get_person_geometry(landmarks, width, height):
         'img_width': width
     }
 
-def inpaint_remove_original_body(img_a_bgr, rgba_a, neck_y):
+def inpaint_remove_original_body(img_a_bgr, rgba_a, neck_point, norm_up):
     h, w = img_a_bgr.shape[:2]
     person_alpha = rgba_a[:, :, 3]
 
-    body_mask = np.zeros((h, w), dtype=np.uint8)
-    body_mask[int(neck_y):, :] = person_alpha[int(neck_y):, :]
+    # 根据脖子法向量切分出原图A的身体区域（排除头部）
+    y_coords, x_coords = np.ogrid[:h, :w]
+    dot = (x_coords - neck_point[0]) * norm_up[0] + (y_coords - neck_point[1]) * norm_up[1]
+    is_body = (dot < 5.0) & (person_alpha > 20)
 
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21))
-    body_mask_dilated = cv2.dilate((body_mask > 20).astype(np.uint8) * 255, kernel, iterations=2)
+    body_mask = is_body.astype(np.uint8) * 255
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
+    body_mask_dilated = cv2.dilate(body_mask, kernel, iterations=2)
 
     print("   [Inpaint] 正在抹除原图A中原有的身体、双腿和鞋子，生成干净底图...")
-    clean_bg = cv2.inpaint(img_a_bgr, body_mask_dilated, inpaintRadius=7, flags=cv2.INPAINT_TELEA)
+    clean_bg = cv2.inpaint(img_a_bgr, body_mask_dilated, inpaintRadius=9, flags=cv2.INPAINT_TELEA)
     return clean_bg
 
 def extract_head_a(rgba_a, neck_point, norm_up):
@@ -127,16 +130,19 @@ def compute_alignment_matrix(geom_a, geom_b):
     neck_a = geom_a['neck']
     neck_b = geom_b['neck']
 
+    # 肩宽基准缩放比（人体视觉骨架的核心尺度）
+    scale_shoulder = geom_a['shoulder_width'] / (geom_b['shoulder_width'] + 1e-5)
+
     if geom_a['is_full_body'] and geom_b['is_full_body']:
         height_a = geom_a['ground_y'] - neck_a[1]
         height_b = geom_b['ground_y'] - neck_b[1]
         
         scale_y = height_a / (height_b + 1e-5)
-        scale_x = geom_a['shoulder_width'] / (geom_b['shoulder_width'] + 1e-5)
-        
+        # 全身对齐时：优先保证纵向接地与身高的自然比例，但横向不低于肩宽的 85%
+        scale_x = scale_shoulder
         aspect_ratio = scale_x / scale_y
-        if aspect_ratio < 0.85 or aspect_ratio > 1.15:
-            scale_x = scale_y * 0.95
+        if aspect_ratio < 0.85 or aspect_ratio > 1.25:
+            scale_x = np.clip(scale_x, scale_y * 0.85, scale_y * 1.25)
 
         tx = neck_a[0] - neck_b[0] * scale_x
         ty = neck_a[1] - neck_b[1] * scale_y
@@ -144,17 +150,13 @@ def compute_alignment_matrix(geom_a, geom_b):
         print(f"   [对齐模式: 全身接地锁定] 缩放(X={scale_x:.2f}, Y={scale_y:.2f}), 脚底对准高度 Y={geom_a['ground_y']:.1f}")
 
     elif geom_a['has_visible_hip'] and geom_b['has_visible_hip']:
-        scale_y = geom_a['torso_height'] / (geom_b['torso_height'] + 1e-5)
-        scale_x = geom_a['shoulder_width'] / (geom_b['shoulder_width'] + 1e-5)
-
-        aspect_ratio = scale_x / scale_y
-        if aspect_ratio < 0.85 or aspect_ratio > 1.15:
-            scale_x = scale_y
-
-        tx = neck_a[0] - neck_b[0] * scale_x
-        ty = neck_a[1] - neck_b[1] * scale_y
-        M = np.array([[scale_x, 0, tx], [0, scale_y, ty]], dtype=np.float32)
-        print(f"   [对齐模式: 半身腰胯锁定] 缩放(X={scale_x:.2f}, Y={scale_y:.2f}), 腰部对准高度 Y={geom_a['mid_waist'][1]:.1f}")
+        # 半身/中景模式：必须以【肩宽】为主要物理尺度基准（等比缩放），
+        # 绝不能用躯干垂直高度粗暴覆盖横向肩宽导致身体缩成细条！
+        scale = scale_shoulder
+        tx = neck_a[0] - neck_b[0] * scale
+        ty = neck_a[1] - neck_b[1] * scale
+        M = np.array([[scale, 0, tx], [0, scale, ty]], dtype=np.float32)
+        print(f"   [对齐模式: 半身肩宽锚定] 等比缩放={scale:.2f} (肩宽={geom_a['shoulder_width']:.1f}px), 颈部精准锁位")
 
     else:
         pts_src = np.array([geom_b['neck'], geom_b['left_shoulder'], geom_b['right_shoulder']], dtype=np.float32)
@@ -249,55 +251,50 @@ def save_5layer_psd_and_png(img_a_rgb, clean_bg_bgr, raw_b_rgb, aligned_body_b, 
     # 注意：Photoshop 图层堆叠顺序是从下到上。
     # pytoshop 的 layer 列表：第一个为底层，最后一个为顶层。
     
-    # Layer 1 (底层): 原图 (人像A完整原图) [隐藏]
+    # 规范化图层命名与层级：
+    # Layer 1 (基底备份): [01] Original (Photo A) - 隐藏
     l1_orig_a = nested_layers.Image(
-        name='原图',
+        name='[01] Original (Photo A)',
         visible=False,
         top=0, left=0, bottom=h_a, right=w_a,
         channels={0: img_a_rgb[:, :, 0], 1: img_a_rgb[:, :, 1], 2: img_a_rgb[:, :, 2]}
     )
 
-    # Layer 2: Clean Background [显示]
+    # Layer 2 (干净底图): [02] Clean Background - 显示
     l2_clean_bg = nested_layers.Image(
-        name='Clean Background',
+        name='[02] Clean Background',
         visible=True,
         top=0, left=0, bottom=h_a, right=w_a,
         channels={0: clean_bg_rgb[:, :, 0], 1: clean_bg_rgb[:, :, 1], 2: clean_bg_rgb[:, :, 2]}
     )
 
-    # Layer 3: Photo B Body 不rmbg [隐藏]
+    # Layer 3 (未抠图身体参考): [03] Photo B Body (Unmasked Ref) - 隐藏
     l3_raw_b = nested_layers.Image(
-        name='Photo B Body 不rmbg',
+        name='[03] Photo B Body (Unmasked Ref)',
         visible=False,
         top=0, left=0, bottom=h_a, right=w_a,
         channels={0: aligned_raw_b[:, :, 0], 1: aligned_raw_b[:, :, 1], 2: aligned_raw_b[:, :, 2]}
     )
 
-    # Layer 4: Photo B Body [显示]
+    # Layer 4 (对齐身体层): [04] Photo B Body (Aligned) - 显示
     l4_body_b = nested_layers.Image(
-        name='Photo B Body',
+        name='[04] Photo B Body (Aligned)',
         visible=True,
         top=0, left=0, bottom=h_a, right=w_a,
         channels={-1: aligned_body_b[:, :, 3], 0: aligned_body_b[:, :, 0], 1: aligned_body_b[:, :, 1], 2: aligned_body_b[:, :, 2]}
     )
 
-    # Layer 5 (顶层): Photo A Head [显示]
+    # Layer 5 (顶层人像A头): [05] Photo A Head (Foreground) - 显示
     l5_head_a = nested_layers.Image(
-        name='Photo A Head',
+        name='[05] Photo A Head (Foreground)',
         visible=True,
         top=0, left=0, bottom=h_a, right=w_a,
         channels={-1: head_a[:, :, 3], 0: head_a[:, :, 0], 1: head_a[:, :, 1], 2: head_a[:, :, 2]}
     )
 
-    # Photoshop 图层面板自顶向下显示：
-    # 经实测验证，传入 nested_layers_to_psd 的顺序为 [底, ..., 顶]：
-    # 即：[原图, Clean Background, Photo B Body 不rmbg, Photo B Body, Photo A Head]
-    # 这样在 Photoshop 中：
-    # 第 1 行 (最顶层): Photo A Head (显示)
-    # 第 2 行: Photo B Body (显示)
-    # 第 3 行: Photo B Body 不rmbg (隐藏)
-    # 第 4 行: Clean Background (显示)
-    # 第 5 行 (最底层): 原图 (隐藏)
+    # 必须传入 [01, 02, 03, 04, 05]：
+    # pytoshop 在内部会自动反转，反转后 [05] Photo A Head 会位于 PSD 文件的第 1 个图层槽位 (Slot 0)，
+    # 这样在 Photoshop 图层面板中，第 1 行【最顶层】就是 [05] Photo A Head，最底层就是 [01] Original！
     layers_order = [l1_orig_a, l2_clean_bg, l3_raw_b, l4_body_b, l5_head_a]
     psd = nested_layers.nested_layers_to_psd(layers_order, color_mode=pytoshop.enums.ColorMode.rgb)
     with open(out_psd_path, 'wb') as f:
@@ -343,7 +340,7 @@ def run_swap(target_a, donor_b, output_prefix):
     # 3. 擦除原图A身体
     print("[3/5] 底图人像遮罩擦除 (生成 Clean Background)...")
     img_a_bgr = cv2.imread(target_a)
-    clean_bg = inpaint_remove_original_body(img_a_bgr, rgba_a, geom_a['neck'][1])
+    clean_bg = inpaint_remove_original_body(img_a_bgr, rgba_a, geom_a['neck'], norm_up_a)
 
     # 4. 计算变换矩阵并对齐
     print("[4/5] 计算姿态几何对齐变换（自适应腰部/地平线锁定）...")
