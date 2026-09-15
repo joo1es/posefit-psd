@@ -82,12 +82,27 @@ def get_person_geometry(landmarks, width, height):
     is_full_body = is_standing
     ground_y = float(np.max(foot_pts_y)) if is_full_body else None
 
+    # 头部解剖尺度测量 (Head Physical Anatomical Scale)
+    # 鼻根到颈部基底中点的距离 (极度稳定的刚体尺度，不受身体 90 度旋转投影压缩影响)
+    head_size = float(np.linalg.norm(nose - neck))
+    eye_dist = float(np.linalg.norm(np.array([landmarks[2].x - landmarks[5].x, landmarks[2].y - landmarks[5].y])) * width)
+    
+    # 身体侧向偏角判定：头肩比 (Shoulder / Eye_dist)
+    # 正常正面/半身时 shoulder_width / eye_dist 约 4.0 ~ 6.0
+    # 当纯侧面 90 度时，2D 投影肩宽极度萎缩，比例会低于 3.3
+    is_side_angle = False
+    if eye_dist > 5.0 and (shoulder_width / eye_dist) < 3.3:
+        is_side_angle = True
+
     return {
         'neck': neck,
         'left_shoulder': ls,
         'right_shoulder': rs,
         'mid_shoulder': mid_shoulder,
         'shoulder_width': shoulder_width,
+        'head_size': head_size,
+        'eye_dist': eye_dist,
+        'is_side_angle': is_side_angle,
         'has_visible_hip': has_visible_hip,
         'mid_waist': mid_waist,
         'waist_width': waist_width,
@@ -162,7 +177,17 @@ def compute_alignment_matrix(geom_a, geom_b):
     neck_a = geom_a['neck']
     neck_b = geom_b['neck']
 
-    # 肩宽基准缩放比（人体视觉骨架的核心尺度）
+    # 1. 核心防御：检测到任一方为纯侧面 90 度 (is_side_angle) 时，2D 投影肩宽失效，
+    # 自动切换为「头部解剖物理尺度 (Head-Anchored Scale)」！
+    if geom_a['is_side_angle'] or geom_b['is_side_angle']:
+        scale_head = geom_a['head_size'] / (geom_b['head_size'] + 1e-5)
+        tx = neck_a[0] - neck_b[0] * scale_head
+        ty = neck_a[1] - neck_b[1] * scale_head
+        M = np.array([[scale_head, 0, tx], [0, scale_head, ty]], dtype=np.float32)
+        print(f"   [对齐模式: 头部解剖尺度锚定 (侧身防崩保护)] 纯侧面姿态识别成功，基于头部真实物理比例等比缩放={scale_head:.2f}")
+        return M
+
+    # 2. 常规正面/微侧姿态：使用肩宽作为视觉骨架基准
     scale_shoulder = geom_a['shoulder_width'] / (geom_b['shoulder_width'] + 1e-5)
 
     if geom_a['is_full_body'] and geom_b['is_full_body']:
@@ -211,6 +236,10 @@ def fit_torso_width(aligned_img, geom_a, geom_b, M):
     - 仅对躯干区域平滑变形，避免四肢拉扯失真
     """
     if not (geom_a['has_visible_hip'] and geom_b['has_visible_hip']):
+        return aligned_img
+
+    # 纯侧身姿态不适用正面梯形腰胯渐变
+    if geom_a['is_side_angle'] or geom_b['is_side_angle']:
         return aligned_img
 
     h, w = aligned_img.shape[:2]
