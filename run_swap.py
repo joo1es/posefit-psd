@@ -18,8 +18,19 @@ import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 import pytoshop
+import pytoshop.codecs
 from pytoshop.user import nested_layers
 import rembg
+import packbits
+
+# 解决 pytoshop 对 packbits 引用及 NumPy 2.x 对 uint8(-1) 溢出报错的问题
+pytoshop.codecs.packbits = packbits
+_orig_compress_image = pytoshop.codecs.compress_image
+def _patched_compress_image(fd, image, compression, shape, num_channels, depth, version):
+    if isinstance(image, int) and image < 0:
+        image = 255
+    return _orig_compress_image(fd, image, compression, shape, num_channels, depth, version)
+pytoshop.codecs.compress_image = _patched_compress_image
 
 def detect_pose(image_path, model_path, person_idx=None):
     img = cv2.imread(image_path)
@@ -532,8 +543,9 @@ def save_5layer_psd_and_png(img_a_rgb, clean_bg_bgr, raw_b_rgb, aligned_body_b, 
         psd.write(f)
     print(f"[5图层 PSD]: {out_psd_path}")
 
-def run_swap(target_a, donor_b, output_prefix, target_person=None, donor_person=None):
-    model_path = r"C:\Users\jooies\Downloads\person\models\pose_landmarker.task"
+def run_swap(target_a, donor_b, output_prefix, target_person=None, donor_person=None, model_path=None):
+    if not model_path:
+        model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "pose_landmarker.task")
     out_psd = f"{output_prefix}.psd"
     out_png = f"{output_prefix}.png"
 
@@ -595,6 +607,7 @@ if __name__ == '__main__':
     parser.add_argument("--target_person", type=int, default=None, help="目标图A人物序号(从左到右1, 2...，默认居中主体)")
     parser.add_argument("--donor_person", type=int, default=None, help="身体图B人物序号(从左到右1, 2...，默认居中主体)")
     parser.add_argument("--output", default="final_5layers_swap", help="输出文件前缀")
+    parser.add_argument("--model", default=None, help="MediaPipe姿态模型路径(默认使用models/pose_landmarker.task)")
     args = parser.parse_args()
 
-    run_swap(args.target, args.donor, args.output, target_person=args.target_person, donor_person=args.donor_person)
+    run_swap(args.target, args.donor, args.output, target_person=args.target_person, donor_person=args.donor_person, model_path=args.model)
