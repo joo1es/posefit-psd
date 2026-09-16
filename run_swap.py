@@ -464,7 +464,57 @@ def fit_torso_width(aligned_img, geom_a, geom_b, M):
     )
     return warped
 
-def save_5layer_psd_and_png(img_a_rgb, clean_bg_bgr, raw_b_rgb, aligned_body_b, head_a, M, out_psd_path, out_png_path, geom_a, geom_b):
+def color_transfer_lab(aligned_body_b, img_a_rgb, geom_a):
+    """
+    Reinhard LAB 颜色迁移：将供体 B 身体的肤色/亮度/冷暖色调同步到目标照片 A 的光照环境。
+    采样颈部/肩部区域作为参考统计区。
+    """
+    h, w = img_a_rgb.shape[:2]
+    alpha_b = aligned_body_b[:, :, 3]
+
+    neck_a = geom_a['neck']
+    sh_w = geom_a['shoulder_width']
+
+    # 采样区域：以 A 的颈部为中心，纵向±40%肩宽，横向±60%肩宽
+    cy, cx = int(neck_a[1]), int(neck_a[0])
+    band_h, band_w = int(sh_w * 0.4), int(sh_w * 0.6)
+    y1, y2 = max(0, cy - band_h), min(h, cy + band_h)
+    x1, x2 = max(0, cx - band_w), min(w, cx + band_w)
+
+    # A 的采样区 (RGB → LAB)
+    roi_a = img_a_rgb[y1:y2, x1:x2]
+    lab_a = cv2.cvtColor(roi_a, cv2.COLOR_RGB2LAB).astype(np.float32)
+    mean_a = lab_a.mean(axis=(0, 1))
+    std_a = lab_a.std(axis=(0, 1)) + 1e-5
+
+    # B 的采样区（仅取有内容的像素 alpha>30）
+    roi_b_rgba = aligned_body_b[y1:y2, x1:x2]
+    mask_b = roi_b_rgba[:, :, 3] > 30
+    if mask_b.sum() < 100:
+        print("   [色调迁移] 采样区 B 像素不足，跳过颜色匹配")
+        return aligned_body_b
+
+    lab_b_roi = cv2.cvtColor(roi_b_rgba[:, :, :3], cv2.COLOR_RGB2LAB).astype(np.float32)
+    b_pixels = lab_b_roi[mask_b]
+    mean_b = b_pixels.mean(axis=0)
+    std_b = b_pixels.std(axis=0) + 1e-5
+
+    # 对整个 B 身体应用 Reinhard 迁移
+    body_lab = cv2.cvtColor(aligned_body_b[:, :, :3], cv2.COLOR_RGB2LAB).astype(np.float32)
+    for c in range(3):
+        body_lab[:, :, c] = (body_lab[:, :, c] - mean_b[c]) * (std_a[c] / std_b[c]) + mean_a[c]
+
+    body_lab = np.clip(body_lab, 0, 255).astype(np.uint8)
+    corrected_rgb = cv2.cvtColor(body_lab, cv2.COLOR_LAB2RGB)
+
+    result = aligned_body_b.copy()
+    result[:, :, :3] = corrected_rgb
+
+    shift_l = mean_a[0] - mean_b[0]
+    print(f"   [色调迁移] Reinhard LAB 匹配完成 (亮度偏移 ΔL={shift_l:+.1f}, A色温={mean_a[1]:.1f}→B色温={mean_b[1]:.1f})")
+    return result
+
+def save_6layer_psd_and_png(img_a_rgb, clean_bg_bgr, raw_b_rgb, aligned_body_b_original, aligned_body_b_matched, head_a, M, out_psd_path, out_png_path, geom_a, geom_b):
     h_a, w_a = img_a_rgb.shape[:2]
     clean_bg_rgb = cv2.cvtColor(clean_bg_bgr, cv2.COLOR_BGR2RGB)
 
@@ -477,25 +527,22 @@ def save_5layer_psd_and_png(img_a_rgb, clean_bg_bgr, raw_b_rgb, aligned_body_b, 
     )
 
     # 躯干肩宽与胯宽双轴微调拟合
-    aligned_body_b = fit_torso_width(aligned_body_b, geom_a, geom_b, M)
+    aligned_body_b_original = fit_torso_width(aligned_body_b_original, geom_a, geom_b, M)
+    aligned_body_b_matched = fit_torso_width(aligned_body_b_matched, geom_a, geom_b, M)
     aligned_raw_b = fit_torso_width(aligned_raw_b, geom_a, geom_b, M)
 
-    # 1. 导出合并 PNG 预览
-    # 采用 Clean Background 中的 100% 原始未抠图头部与发丝，避免抠图毛刺
+    # 1. 导出合并 PNG 预览（使用色调匹配后的版本）
     comp = clean_bg_rgb.astype(np.float32)
-    alpha_body = aligned_body_b[:, :, 3:4].astype(np.float32) / 255.0
-    comp = aligned_body_b[:, :, :3] * alpha_body + comp * (1.0 - alpha_body)
+    alpha_body = aligned_body_b_matched[:, :, 3:4].astype(np.float32) / 255.0
+    comp = aligned_body_b_matched[:, :, :3] * alpha_body + comp * (1.0 - alpha_body)
     
     comp_arr = np.clip(comp, 0, 255).astype(np.uint8)
     Image.fromarray(comp_arr).save(out_png_path)
     print(f"[PNG 预览图]: {out_png_path}")
 
-    # 2. 导出标准 5 图层 PSD
-    # 注意：Photoshop 图层堆叠顺序是从下到上。
-    # pytoshop 的 layer 列表：第一个为底层，最后一个为顶层。
-    
-    # 规范化图层命名与层级：
-    # Layer 1 (基底备份): [01] Original (Photo A) - 隐藏
+    # 2. 导出标准 6 图层 PSD
+    # Photoshop 图层面板自顶向下：[06] Head → [05] Color Matched → [04] Original Color → [03] Unmasked → [02] Clean BG → [01] Original A
+
     l1_orig_a = nested_layers.Image(
         name='[01] Original (Photo A)',
         visible=False,
@@ -503,7 +550,6 @@ def save_5layer_psd_and_png(img_a_rgb, clean_bg_bgr, raw_b_rgb, aligned_body_b, 
         channels={0: img_a_rgb[:, :, 0], 1: img_a_rgb[:, :, 1], 2: img_a_rgb[:, :, 2]}
     )
 
-    # Layer 2 (干净底图): [02] Clean Background - 显示
     l2_clean_bg = nested_layers.Image(
         name='[02] Clean Background',
         visible=True,
@@ -511,7 +557,6 @@ def save_5layer_psd_and_png(img_a_rgb, clean_bg_bgr, raw_b_rgb, aligned_body_b, 
         channels={0: clean_bg_rgb[:, :, 0], 1: clean_bg_rgb[:, :, 1], 2: clean_bg_rgb[:, :, 2]}
     )
 
-    # Layer 3 (未抠图身体参考): [03] Photo B Body (Unmasked Ref) - 隐藏
     l3_raw_b = nested_layers.Image(
         name='[03] Photo B Body (Unmasked Ref)',
         visible=False,
@@ -519,29 +564,34 @@ def save_5layer_psd_and_png(img_a_rgb, clean_bg_bgr, raw_b_rgb, aligned_body_b, 
         channels={0: aligned_raw_b[:, :, 0], 1: aligned_raw_b[:, :, 1], 2: aligned_raw_b[:, :, 2]}
     )
 
-    # Layer 4 (对齐身体层): [04] Photo B Body (Aligned) - 显示
-    l4_body_b = nested_layers.Image(
-        name='[04] Photo B Body (Aligned)',
-        visible=True,
+    # Layer 4: 原始颜色身体（隐藏备用）
+    l4_body_original = nested_layers.Image(
+        name='[04] Photo B Body (Original Color)',
+        visible=False,
         top=0, left=0, bottom=h_a, right=w_a,
-        channels={-1: aligned_body_b[:, :, 3], 0: aligned_body_b[:, :, 0], 1: aligned_body_b[:, :, 1], 2: aligned_body_b[:, :, 2]}
+        channels={-1: aligned_body_b_original[:, :, 3], 0: aligned_body_b_original[:, :, 0], 1: aligned_body_b_original[:, :, 1], 2: aligned_body_b_original[:, :, 2]}
     )
 
-    # Layer 5 (顶层人像A头备用): [05] Photo A Head (Foreground) - 隐藏（按方案A默认关闭，保留备用）
-    l5_head_a = nested_layers.Image(
-        name='[05] Photo A Head (Foreground)',
+    # Layer 5: 色调匹配后的身体（显示）
+    l5_body_matched = nested_layers.Image(
+        name='[05] Photo B Body (Color Matched)',
+        visible=True,
+        top=0, left=0, bottom=h_a, right=w_a,
+        channels={-1: aligned_body_b_matched[:, :, 3], 0: aligned_body_b_matched[:, :, 0], 1: aligned_body_b_matched[:, :, 1], 2: aligned_body_b_matched[:, :, 2]}
+    )
+
+    l6_head_a = nested_layers.Image(
+        name='[06] Photo A Head (Foreground)',
         visible=False,
         top=0, left=0, bottom=h_a, right=w_a,
         channels={-1: head_a[:, :, 3], 0: head_a[:, :, 0], 1: head_a[:, :, 1], 2: head_a[:, :, 2]}
     )
 
-    # 传入图层顺序：[05, 04, 03, 02, 01]
-    # 在 Photoshop 图层面板中自顶向下排布：[05] 头在最顶层，[01] 原图在最底层
-    layers_order = [l5_head_a, l4_body_b, l3_raw_b, l2_clean_bg, l1_orig_a]
+    layers_order = [l6_head_a, l5_body_matched, l4_body_original, l3_raw_b, l2_clean_bg, l1_orig_a]
     psd = nested_layers.nested_layers_to_psd(layers_order, color_mode=pytoshop.enums.ColorMode.rgb)
     with open(out_psd_path, 'wb') as f:
         psd.write(f)
-    print(f"[5图层 PSD]: {out_psd_path}")
+    print(f"[6图层 PSD]: {out_psd_path}")
 
 def run_swap(target_a, donor_b, output_prefix, target_person=None, donor_person=None, model_path=None):
     if not model_path:
@@ -549,7 +599,7 @@ def run_swap(target_a, donor_b, output_prefix, target_person=None, donor_person=
     out_psd = f"{output_prefix}.psd"
     out_png = f"{output_prefix}.png"
 
-    print(">> 启动 5 图层 PSD 流水线...")
+    print(">> 启动 6 图层 PSD 流水线...")
     rembg_session = rembg.new_session('u2netp')
 
     # 读取原图 A 与 B
@@ -559,7 +609,7 @@ def run_swap(target_a, donor_b, output_prefix, target_person=None, donor_person=
     img_b_rgb = np.array(img_b_pil)
 
     # 1. 骨骼点检测（支持多人照片指定选人）
-    print("[1/5] 检测双人骨骼点（颈肩、腰胯、脚底接地）...")
+    print("[1/6] 检测双人骨骼点（颈肩、腰胯、脚底接地）...")
     lm_a, w_a, h_a, others_a = detect_pose(target_a, model_path, person_idx=target_person)
     lm_b, w_b, h_b, others_b = detect_pose(donor_b, model_path, person_idx=donor_person)
 
@@ -567,7 +617,7 @@ def run_swap(target_a, donor_b, output_prefix, target_person=None, donor_person=
     geom_b = get_person_geometry(lm_b, w_b, h_b, other_candidates=others_b)
 
     # 2. 抠图与部位拆分
-    print("[2/5] 智能抠图并分离头部与身体...")
+    print("[2/6] 智能抠图并分离头部与身体...")
     rgba_a = np.array(rembg.remove(Image.fromarray(img_a_rgb), session=rembg_session))
     rgba_b = np.array(rembg.remove(Image.fromarray(img_b_rgb), session=rembg_session))
 
@@ -581,7 +631,7 @@ def run_swap(target_a, donor_b, output_prefix, target_person=None, donor_person=
     body_b = extract_body_b(rgba_b, geom_b['neck'], norm_up_b, geom_b=geom_b)
 
     # 3. 计算姿态几何对齐变换（自适应腰部/地平线锁定）
-    print("[3/5] 计算姿态几何对齐变换（自适应腰部/地平线锁定）...")
+    print("[3/6] 计算姿态几何对齐变换（自适应腰部/地平线锁定）...")
     M = compute_alignment_matrix(geom_a, geom_b)
     aligned_body_b = cv2.warpAffine(
         body_b, M, (w_a, h_a),
@@ -590,14 +640,18 @@ def run_swap(target_a, donor_b, output_prefix, target_person=None, donor_person=
         borderValue=(0, 0, 0, 0)
     )
 
-    # 4. 擦除原图A身体（智能保留下半身）
-    print("[4/5] 底图人像遮罩擦除 (生成 Clean Background)...")
+    # 4. Reinhard LAB 色调迁移（同步肤色与亮暗）
+    print("[4/6] Reinhard LAB 色调迁移（同步肤色与光照）...")
+    aligned_body_b_matched = color_transfer_lab(aligned_body_b, img_a_rgb, geom_a)
+
+    # 5. 擦除原图A身体（智能保留下半身）
+    print("[5/6] 底图人像遮罩擦除 (生成 Clean Background)...")
     img_a_bgr = cv2.imread(target_a)
     clean_bg = inpaint_remove_original_body(img_a_bgr, rgba_a, geom_a, norm_up_a, aligned_body_b=aligned_body_b, geom_b=geom_b)
 
-    # 5. 打包 5 图层 PSD 与 预览 PNG
-    print("[5/5] 保存 5 图层 PSD 与 PNG 预览图...")
-    save_5layer_psd_and_png(img_a_rgb, clean_bg, img_b_rgb, aligned_body_b, head_a, M, out_psd, out_png, geom_a, geom_b)
+    # 6. 打包 6 图层 PSD 与 预览 PNG
+    print("[6/6] 保存 6 图层 PSD 与 PNG 预览图...")
+    save_6layer_psd_and_png(img_a_rgb, clean_bg, img_b_rgb, aligned_body_b, aligned_body_b_matched, head_a, M, out_psd, out_png, geom_a, geom_b)
     print(">> 任务全部成功！")
 
 if __name__ == '__main__':
